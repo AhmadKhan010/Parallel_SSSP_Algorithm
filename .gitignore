@@ -1,0 +1,8 @@
+# Ignore all .json files
+*.json
+
+# Ignore all .properties files
+*.properties
+
+# Ignore all .exe files
+*.exe
