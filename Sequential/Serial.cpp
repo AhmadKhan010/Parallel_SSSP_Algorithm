@@ -3,10 +3,10 @@
 #include <queue>
 #include <limits>
 #include <algorithm>
+#include <cmath>
+#include <fstream>
 
 using namespace std;
-
-const double INFINITY = numeric_limits<double>::infinity();
 
 // Edge structure for updates
 struct Edge {
@@ -26,39 +26,53 @@ struct Graph {
     int m;                  // Number of edges
 
     Graph(int n, int m, const vector<int>& src, const vector<int>& dst, const vector<double>& weights) {
-        this->n = n;
-        this->m = m * 2; // Double for undirected edges
-        dist.resize(n, INFINITY);
-        parent.resize(n, -1);
-        children.resize(n);
-        row_ptr.resize(n + 1, 0);
-        adj.resize(this->m);
-        this->weights.resize(this->m);
+        try {
+            if (n <= 0 || m <= 0) {
+                throw runtime_error("Invalid graph size");
+            }
 
-        // Build CSR: count edges per vertex (including reverse edges)
-        vector<int> edge_count(n, 0);
-        for (int i = 0; i < m; i++) {
-            edge_count[src[i]]++;
-            edge_count[dst[i]]++; // Reverse edge
-        }
-        row_ptr[0] = 0;
-        for (int i = 0; i < n; i++) {
-            row_ptr[i + 1] = row_ptr[i] + edge_count[i];
-        }
+            this->n = n;
+            this->m = m * 2; // Double for undirected edges
+            
+            // Resize vectors for 1-based indexing
+            dist.resize(n + 1, INFINITY);
+            parent.resize(n + 1, -1);
+            children.resize(n + 1);
+            row_ptr.resize(n + 2, 0);
+            adj.resize(this->m);
+            this->weights.resize(this->m);
 
-        // Fill adjacency and weights (including reverse edges)
-        vector<int> current_pos(n, 0);
-        for (int i = 0; i < m; i++) {
-            // Forward edge
-            int v = src[i];
-            int pos = row_ptr[v] + current_pos[v]++;
-            adj[pos] = dst[i];
-            this->weights[pos] = weights[i];
-            // Reverse edge
-            v = dst[i];
-            pos = row_ptr[v] + current_pos[v]++;
-            adj[pos] = src[i];
-            this->weights[pos] = weights[i];
+            // Build CSR with 1-based indexing
+            vector<int> edge_count(n + 1, 0);
+            for (int i = 0; i < m; i++) {
+                edge_count[src[i]]++;
+                edge_count[dst[i]]++;
+            }
+
+            row_ptr[1] = 0;
+            for (int i = 1; i <= n; i++) {
+                row_ptr[i + 1] = row_ptr[i] + edge_count[i];
+                if (row_ptr[i + 1] > this->m) {
+                    throw runtime_error("CSR index out of bounds");
+                }
+            }
+
+            vector<int> current_pos(n + 1, 0);
+            for (int i = 0; i < m; i++) {
+                // Forward edge
+                int v = src[i];
+                int pos = row_ptr[v] + current_pos[v]++;
+                adj[pos] = dst[i];
+                this->weights[pos] = weights[i];
+                // Reverse edge
+                v = dst[i];
+                pos = row_ptr[v] + current_pos[v]++;
+                adj[pos] = src[i];
+                this->weights[pos] = weights[i];
+            }
+        } catch (const exception& e) {
+            cerr << "Error creating graph: " << e.what() << endl;
+            throw;
         }
     }
 
@@ -156,47 +170,104 @@ void updateSSSPBatch(Graph& g, const vector<Edge>& changes, const vector<bool>& 
     }
 }
 
+void dijkstra(Graph& g, int source) {
+    try {
+        if (source < 1 || source > g.n) {
+            throw runtime_error("Invalid source vertex");
+        }
+
+        fill(g.dist.begin(), g.dist.end(), INFINITY);
+        fill(g.parent.begin(), g.parent.end(), -1);
+        
+        priority_queue<pair<double, int>, vector<pair<double, int>>, Compare> pq;
+        vector<bool> visited(g.n + 1, false);
+        
+        g.dist[source] = 0.0;
+        pq.push({0.0, source});
+        
+        while (!pq.empty()) {
+            double d = pq.top().first;
+            int u = pq.top().second;
+            pq.pop();
+            
+            if (visited[u]) continue;
+            visited[u] = true;
+            
+            for (int i = g.row_ptr[u]; i < g.row_ptr[u + 1]; i++) {
+                int v = g.adj[i];
+                if (visited[v]) continue;
+                
+                double w = g.weights[i];
+                if (g.dist[u] + w < g.dist[v]) {
+                    g.dist[v] = g.dist[u] + w;
+                    g.parent[v] = u;
+                    pq.push({g.dist[v], v});
+                }
+            }
+        }
+    } catch (const exception& e) {
+        cerr << "Error in Dijkstra's algorithm: " << e.what() << endl;
+        throw;
+    }
+}
+
+void load_data(string filename, int& n, int& m, vector<int>& src, vector<int>& dst, vector<double>& weights) {
+    ifstream file(filename);
+    if (!file.is_open()) {
+        throw runtime_error("Error opening file: " + filename);
+    }
+
+    file >> n >> m;
+    src.resize(m);
+    dst.resize(m);
+    weights.resize(m);
+
+    for (int i = 0; i < m; i++) {
+        file >> src[i] >> dst[i] >> weights[i];
+        // No need to subtract 1 from vertices as we're using 1-based indexing
+    }
+    file.close();
+}
+
 int main() {
-    // Example graph: 5 vertices, 5 edges (undirected)
-    int n = 5, m = 5;
-    vector<int> src = {0, 0, 1, 2, 3}; // Source vertices
-    vector<int> dst = {1, 2, 3, 3, 4};  // Destination vertices
-    vector<double> weights = {1.0, 4.0, 2.0, 2.0, 1.0}; // Edge weights
+    try {
+        int n, m;
+        vector<int> src, dst;
+        vector<double> weights;
 
-    Graph g(n, m, src, dst, weights);
+        string filename = "data.txt";
+        load_data(filename, n, m, src, dst, weights);
+        cout << "Loaded graph with " << n << " vertices and " << m << " edges" << endl;
 
-    // Set initial SSSP from source vertex 0
-    g.dist[0] = 0.0;
-    g.parent[0] = -1;
-    g.dist[1] = 1.0;
-    g.parent[1] = 0;
-    g.dist[2] = 4.0;
-    g.parent[2] = 0;
-    g.dist[3] = 3.0;
-    g.parent[3] = 1;
-    g.dist[4] = 4.0;
-    g.parent[4] = 3;
+        Graph g(n, m, src, dst, weights);
 
-    // Example batch of updates
-    vector<Edge> changes = {
-        {2, 4, 1.5}, // Insertion: edge (2,4) with weight 1.5
-        {0, 1, 1.0}, // Deletion: edge (0,1)
-        {1, 4, 2.0}  // Insertion: edge (1,4) with weight 2.0
-    };
-    vector<bool> isInsertion = {true, false, true};
+        // Initialize SSSP tree using Dijkstra's algorithm from vertex 1
+        dijkstra(g, 1);
+        cout << "Completed initial SSSP computation" << endl;
 
-    cout << "Before updates:\n";
-    for (int i = 0; i < n; i++) {
-        cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
+        // Example batch of updates (using 1-based vertex numbers)
+        vector<Edge> changes = {
+            {2, 4, 1.5},  // Insertion
+            {1, 2, 1.0},  // Deletion
+            {1, 4, 2.0}   // Insertion
+        };
+        vector<bool> isInsertion = {true, false, true};
+
+        cout << "Before updates:\n";
+        for (int i = 1; i <= n; i++) {
+            cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
+        }
+
+        updateSSSPBatch(g, changes, isInsertion);
+
+        cout << "\nAfter updates:\n";
+        for (int i = 1; i <= n; i++) {
+            cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
+        }
+
+    } catch (const exception& e) {
+        cerr << "Fatal error: " << e.what() << endl;
+        return 1;
     }
-
-    // Update SSSP
-    updateSSSPBatch(g, changes, isInsertion);
-
-    cout << "\nAfter updates:\n";
-    for (int i = 0; i < n; i++) {
-        cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
-    }
-
     return 0;
 }
