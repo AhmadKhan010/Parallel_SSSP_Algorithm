@@ -144,6 +144,24 @@ void syncGhostVertices(Graph& g, int rank, int size) {
     }
 }
 
+// Remove an edge from the local CSR representation (both directions for undirected)
+void removeEdgeCSR(Graph& g, int u, int v) {
+    // Remove v from u's adjacency
+    for (int i = g.row_ptr[u]; i < g.row_ptr[u + 1]; ++i) {
+        if (g.adj[i] == v) {
+            g.adj[i] = -1; // Mark as removed
+            g.weights[i] = INFINITY;
+        }
+    }
+    // Remove u from v's adjacency
+    for (int i = g.row_ptr[v]; i < g.row_ptr[v + 1]; ++i) {
+        if (g.adj[i] == u) {
+            g.adj[i] = -1;
+            g.weights[i] = INFINITY;
+        }
+    }
+}
+
 // Update SSSP for multiple edge changes
 void updateSSSPBatch(Graph& g, const vector<Edge>& changes, int rank, int size) {
     priority_queue<pair<double, int>, vector<pair<double, int>>, Compare> pq;
@@ -153,6 +171,11 @@ void updateSSSPBatch(Graph& g, const vector<Edge>& changes, int rank, int size) 
     for (const auto& change : changes) {
         if (!change.isInsertion && (g.partition[change.u] == rank || g.partition[change.v] == rank)) {
             int u = change.u, v = change.v;
+            // Remove the edge from the local CSR
+            if (g.partition[u] == rank) removeEdgeCSR(g, u, v);
+            if (g.partition[v] == rank) removeEdgeCSR(g, v, u);
+
+            // If the deleted edge was a parent-child in the SSSP tree, mark descendants
             int x = (g.dist[u] > g.dist[v]) ? u : v;
             int y = (x == u) ? v : u;
             if (g.parent[x] == y && g.partition[x] == rank) {
@@ -162,13 +185,25 @@ void updateSSSPBatch(Graph& g, const vector<Edge>& changes, int rank, int size) 
     }
 
     // Synchronize after deletions
+    MPI_Barrier(MPI_COMM_WORLD);
     syncGhostVertices(g, rank, size);
+    MPI_Barrier(MPI_COMM_WORLD);
 
     // Process insertions
     for (const auto& change : changes) {
         if (change.isInsertion && (g.partition[change.u] == rank || g.partition[change.v] == rank)) {
             int u = change.u, v = change.v;
             double w = change.weight;
+            // Insert edge into local CSR if not present (for robustness)
+            bool found_uv = false, found_vu = false;
+            for (int i = g.row_ptr[u]; i < g.row_ptr[u + 1]; ++i) {
+                if (g.adj[i] == v) { found_uv = true; g.weights[i] = w; }
+            }
+            for (int i = g.row_ptr[v]; i < g.row_ptr[v + 1]; ++i) {
+                if (g.adj[i] == u) { found_vu = true; g.weights[i] = w; }
+            }
+            // If not found, skip (robustness: only update SSSP, not CSR structure)
+
             if (g.partition[v] == rank && g.dist[u] + w < g.dist[v]) {
                 g.dist[v] = g.dist[u] + w;
                 g.parent[v] = u;
@@ -181,6 +216,9 @@ void updateSSSPBatch(Graph& g, const vector<Edge>& changes, int rank, int size) 
             }
         }
     }
+    MPI_Barrier(MPI_COMM_WORLD);
+    syncGhostVertices(g, rank, size);
+    MPI_Barrier(MPI_COMM_WORLD);
 
     // Update affected subgraph
     bool local_change = true;
@@ -196,6 +234,7 @@ void updateSSSPBatch(Graph& g, const vector<Edge>& changes, int rank, int size) 
 
             for (int i = g.row_ptr[z]; i < g.row_ptr[z + 1]; i++) {
                 int n = g.adj[i];
+                if (n == -1) continue; // Skip removed edges
                 double w = g.weights[i];
                 if (g.dist[n] > g.dist[z] + w) {
                     g.dist[n] = g.dist[z] + w;
@@ -203,19 +242,16 @@ void updateSSSPBatch(Graph& g, const vector<Edge>& changes, int rank, int size) 
                     if (g.partition[n] == rank) {
                         pq.push({g.dist[n], n});
                         local_change = true;
-                        for (int j = g.row_ptr[n]; j < g.row_ptr[n + 1]; j++) {
-                            int neighbor = g.adj[j];
-                            if (g.partition[neighbor] == rank) {
-                                pq.push({g.dist[neighbor], neighbor});
-                            }
-                        }
+                        // No need to push neighbors of n here, just n is enough
                     }
                 }
             }
         }
 
         // Synchronize ghost vertices
+        MPI_Barrier(MPI_COMM_WORLD);
         syncGhostVertices(g, rank, size);
+        MPI_Barrier(MPI_COMM_WORLD);
 
         // Check for global convergence
         int local_flag = local_change ? 1 : 0;
@@ -310,6 +346,10 @@ vector<int> partitionGraph(int n, int m, const vector<int>& src, const vector<in
         if (ret != METIS_OK) throw runtime_error("METIS partitioning failed");
 
         for (int i = 0; i < n; i++) partition[i + 1] = part[i];
+
+        //Print partitioning result
+        cout << "Partitioning result: ";
+        
     }
 
     MPI_Bcast(partition.data(), n + 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -319,8 +359,8 @@ vector<int> partitionGraph(int n, int m, const vector<int>& src, const vector<in
 int main() {
     MPI_Init(NULL, NULL);
     int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank( MPI_COMM_WORLD, &rank);
+    MPI_Comm_size( MPI_COMM_WORLD, &size);
 
     try {
         int n, m;
@@ -373,7 +413,7 @@ int main() {
         if (rank == 0) {
             changes = {
                 {2, 4, 1.5, true},
-                {1, 2, 1.0, false},
+                {1, 2, 45 ,false},
                 {1, 4, 2.0, true}
             };
             num_changes = changes.size();
