@@ -222,10 +222,21 @@ void load_data(string filename, int& n, int& m, vector<int>& src, vector<int>& d
     dst.resize(m);
     weights.resize(m);
 
+    // Add bounds checking to ensure all vertex IDs are valid
+    int max_vertex_id = 0;
+    
     for (int i = 0; i < m; i++) {
         file >> src[i] >> dst[i] >> weights[i];
-        // No need to subtract 1 from vertices as we're using 1-based indexing
+        max_vertex_id = max(max_vertex_id, max(src[i], dst[i]));
     }
+    
+    // If max vertex ID is larger than reported n, update n
+    if (max_vertex_id > n) {
+        cerr << "Warning: Vertices numbered up to " << max_vertex_id 
+             << " but graph size is " << n << ". Updating n." << endl;
+        n = max_vertex_id;
+    }
+    
     file.close();
 }
 
@@ -235,36 +246,59 @@ int main() {
         vector<int> src, dst;
         vector<double> weights;
 
-        string filename = "data.txt";
-        load_data(filename, n, m, src, dst, weights);
-        cout << "Loaded graph with " << n << " vertices and " << m << " edges" << endl;
+        string filename = "../Dataset/bitcoin.txt";
+        try {
+            load_data(filename, n, m, src, dst, weights);
+            cout << "Loaded graph with " << n << " vertices and " << m << " edges" << endl;
+            
+            // Verify data
+            for (int i = 0; i < m; i++) {
+                if (src[i] <= 0 || src[i] > n || dst[i] <= 0 || dst[i] > n) {
+                    cerr << "Invalid edge: (" << src[i] << ", " << dst[i] << ")" << endl;
+                    throw runtime_error("Edge endpoints out of range");
+                }
+            }
+            
+            // Initialize graph with robust error handling
+            Graph g(n, m, src, dst, weights);
 
-        Graph g(n, m, src, dst, weights);
+            // Initialize SSSP tree using Dijkstra's algorithm from vertex 1
+            dijkstra(g, 1);
+            cout << "Completed initial SSSP computation" << endl;
 
-        // Initialize SSSP tree using Dijkstra's algorithm from vertex 1
-        dijkstra(g, 1);
-        cout << "Completed initial SSSP computation" << endl;
+            // Example batch of updates (using 1-based vertex numbers)
+            vector<Edge> changes = {
+                {2, 4, 1.5},  // Insertion
+                {1, 2, 1.0},  // Deletion
+                {1, 4, 2.0}   // Insertion
+            };
+            
+            // Verify update vertices are in range
+            for (const auto& edge : changes) {
+                if (edge.u <= 0 || edge.u > n || edge.v <= 0 || edge.v > n) {
+                    cerr << "Invalid update edge: (" << edge.u << ", " << edge.v << ")" << endl;
+                    throw runtime_error("Update edge endpoints out of range");
+                }
+            }
+            
+            vector<bool> isInsertion = {true, false, true};
 
-        // Example batch of updates (using 1-based vertex numbers)
-        vector<Edge> changes = {
-            {2, 4, 1.5},  // Insertion
-            {1, 2, 1.0},  // Deletion
-            {1, 4, 2.0}   // Insertion
-        };
-        vector<bool> isInsertion = {true, false, true};
+            cout << "Before updates:\n";
+            for (int i = 1; i <= n; i++) {
+                cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
+            }
 
-        cout << "Before updates:\n";
-        for (int i = 1; i <= n; i++) {
-            cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
+            updateSSSPBatch(g, changes, isInsertion);
+
+            cout << "\nAfter updates:\n";
+            for (int i = 1; i <= n; i++) {
+                cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
+            }
+
+        } catch (const exception& e) {
+            cerr << "Fatal error: " << e.what() << endl;
+            return 1;
         }
-
-        updateSSSPBatch(g, changes, isInsertion);
-
-        cout << "\nAfter updates:\n";
-        for (int i = 1; i <= n; i++) {
-            cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
-        }
-
     } catch (const exception& e) {
         cerr << "Fatal error: " << e.what() << endl;
         return 1;

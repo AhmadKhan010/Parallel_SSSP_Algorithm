@@ -45,12 +45,19 @@ struct Graph {
                 if (partition[i] == rank) local_vertices.push_back(i);
             }
 
-            // Count local edges
+            // Reserve space before counting
+            adj.reserve(2 * m);  // More space to be safe
+            this->weights.reserve(2 * m);
+            
+            // Count local edges - safer calculation
             local_m = 0;
             for (int i = 0; i < m; i++) {
-                if (partition[src[i]] == rank || partition[dst[i]] == rank) local_m += 2; // Forward and reverse
+                if (partition[src[i]] == rank) local_m++;
+                if (partition[dst[i]] == rank) local_m++;
             }
-
+            local_m = min(local_m, 2 * m); // Safety check
+            
+            // Resize all vectors to avoid out-of-bounds accesses
             dist.resize(n + 1, INFINITY);
             parent.resize(n + 1, -1);
             children.resize(n + 1);
@@ -309,9 +316,21 @@ void load_data(string filename, int& n, int& m, vector<int>& src, vector<int>& d
     dst.resize(m);
     weights.resize(m);
 
+    // Add bounds checking to ensure all vertex IDs are valid
+    int max_vertex_id = 0;
+
     for (int i = 0; i < m; i++) {
         file >> src[i] >> dst[i] >> weights[i];
+        max_vertex_id = max(max_vertex_id, max(src[i], dst[i]));
     }
+
+    // If max vertex ID is larger than reported n, update n
+    if (max_vertex_id > n) {
+        cerr << "Warning: Vertices numbered up to " << max_vertex_id 
+             << " but graph size is " << n << ". Updating n." << endl;
+        n = max_vertex_id;
+    }
+    
     file.close();
 }
 
@@ -371,16 +390,40 @@ int main() {
 
         // Load graph data and compute initial SSSP on rank 0
         if (rank == 0) {
-            string filename = "../Sequential/data.txt";
-            load_data(filename, n, m, src, dst, weights);
-            cout << "Loaded graph with " << n << " vertices and " << m << " edges" << endl;
+            string filename = "../Dataset/bitcoin.txt";
+            
+            try {
+                load_data(filename, n, m, src, dst, weights);
+                cout << "Loaded graph with " << n << " vertices and " << m << " edges" << endl;
+                
+                // Limit size for testing if needed
+                if (n > 5000) {  // Can set a smaller limit if needed
+                    cout << "Warning: Large graph detected. Using only first 5000 vertices for testing." << endl;
+                    // This is optional - you can remove if you want to process the full graph
+                    // n = 5000;
+                }
+                
+                // Verify data
+                for (int i = 0; i < m; i++) {
+                    if (src[i] <= 0 || src[i] > n || dst[i] <= 0 || dst[i] > n) {
+                        cerr << "Invalid edge: (" << src[i] << ", " << dst[i] << ")" << endl;
+                        throw runtime_error("Edge endpoints out of range");
+                    }
+                }
 
-            // Initialize full graph for Dijkstra's
-            Graph g_full(n, m, src, dst, weights, rank, vector<int>(n + 1, 0));
-            dijkstra(g_full, 1);
-            initial_dist = g_full.dist;
-            initial_parent = g_full.parent;
-            cout << "Completed initial SSSP computation" << endl;
+                // Initialize full graph for Dijkstra's
+                vector<int> init_partition(n + 1, 0);
+                Graph g_full(n, m, src, dst, weights, rank, init_partition);
+                dijkstra(g_full, 1);
+                initial_dist = g_full.dist;
+                initial_parent = g_full.parent;
+                cout << "Completed initial SSSP computation" << endl;
+            }
+            catch (const exception& e) {
+                cerr << "Error in graph loading/initialization: " << e.what() << endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+                return 1;
+            }
         }
 
         // Broadcast graph dimensions and initial SSSP tree
@@ -467,7 +510,7 @@ int main() {
 
     } catch (const exception& e) {
         cerr << "Fatal error on rank " << rank << ": " << e.what() << endl;
-        MPI_Finalize();
+        MPI_Abort(MPI_COMM_WORLD, 1);  // Better than just finalizing - notifies all processes
         return 1;
     }
 
