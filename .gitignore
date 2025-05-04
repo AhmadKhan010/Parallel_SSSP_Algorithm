@@ -6,3 +6,44 @@
 
 # Ignore all .exe files
 *.exe
+
+# Binary files
+*.out
+*.o
+*.obj
+*.dll
+*.so
+*.dylib
+
+# Build directories
+build/
+bin/
+obj/
+
+# Compiled files
+*.com
+*.class
+*.pyc
+*.pyo
+*.pyd
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Files without extension
+*
+!/**/
+!*.*
+
+# System files
+.DS_Store
+Thumbs.db
