@@ -374,6 +374,29 @@ vector<int> partitionGraph(int n, int m, const vector<int>& src, const vector<in
     MPI_Bcast(partition.data(), n + 1, MPI_INT, 0, MPI_COMM_WORLD);
     return partition;
 }
+void load_updates(const string& filename, vector<Edge>& changes) {
+    ifstream file(filename);
+    if (!file.is_open()) {
+        throw runtime_error("Error opening updates file: " + filename);
+    }
+    int num_updates;
+    file >> num_updates;
+
+    int u, v;
+    double w;
+    int type;
+    while (file >> u >> v >> w >> type) {
+        if (type == 1) {
+            changes.push_back({u, v, w, true});
+        } else if (type == 0) {
+            changes.push_back({u, v, w, false});
+        } else {
+            cerr << "Unknown update type in updates file: " << type << endl;
+        }
+    }
+    file.close();
+}
+
 
 int main() {
     MPI_Init(NULL, NULL);
@@ -388,6 +411,10 @@ int main() {
         vector<double> initial_dist;
         vector<int> initial_parent;
 
+        auto start_time = MPI_Wtime();
+
+
+
         // Load graph data and compute initial SSSP on rank 0
         if (rank == 0) {
             string filename = "../Dataset/bitcoin.txt";
@@ -396,13 +423,7 @@ int main() {
                 load_data(filename, n, m, src, dst, weights);
                 cout << "Loaded graph with " << n << " vertices and " << m << " edges" << endl;
                 
-                // Limit size for testing if needed
-                if (n > 5000) {  // Can set a smaller limit if needed
-                    cout << "Warning: Large graph detected. Using only first 5000 vertices for testing." << endl;
-                    // This is optional - you can remove if you want to process the full graph
-                    // n = 5000;
-                }
-                
+           
                 // Verify data
                 for (int i = 0; i < m; i++) {
                     if (src[i] <= 0 || src[i] > n || dst[i] <= 0 || dst[i] > n) {
@@ -454,12 +475,18 @@ int main() {
         vector<Edge> changes;
         int num_changes = 0;
         if (rank == 0) {
-            changes = {
-                {2, 4, 1.5, true},
-                {1, 2, 45 ,false},
-                {1, 4, 2.0, true}
-            };
-            num_changes = changes.size();
+            string updates_filename = "../Dataset/updates.txt";
+            try {
+
+                load_updates(updates_filename, changes);
+                num_changes = changes.size();
+                cout << "Loaded " << num_changes << " updates" << endl;
+            } catch (const exception& e) {
+                cerr << "Error loading updates: " << e.what() << endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+                return 1;
+            }
+           
         }
         MPI_Bcast(&num_changes, 1, MPI_INT, 0, MPI_COMM_WORLD);
         if (rank != 0) changes.resize(num_changes);
@@ -484,10 +511,11 @@ int main() {
             }
         }
 
+        int print_count = min(10, n);
         // Print initial state
         if (rank == 0) {
             cout << "Before updates:\n";
-            for (int i = 1; i <= n; i++) {
+            for (int i = 1; i <= print_count; i++) {
                 cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
             }
         }
@@ -500,17 +528,26 @@ int main() {
         vector<int> global_parents(n + 1);
         MPI_Reduce(g.dist.data(), global_dists.data(), n + 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
         MPI_Reduce(g.parent.data(), global_parents.data(), n + 1, MPI_INT, MPI_MIN, 0, MPI_COMM_WORLD);
+        
+        auto end_time = MPI_Wtime();
+
+        if (rank == 0) {
+            cout << "Total execution time: " << (end_time - start_time) * 1000 << " ms" << endl;
+        }
+
 
         if (rank == 0) {
             cout << "\nAfter updates:\n";
-            for (int i = 1; i <= n; i++) {
+            
+            for (int i = 1; i <= print_count; i++) {
                 cout << "Vertex " << i << ": Dist = " << global_dists[i] << ", Parent = " << global_parents[i] << "\n";
             }
+            cout<<"..."<<endl;
         }
 
     } catch (const exception& e) {
         cerr << "Fatal error on rank " << rank << ": " << e.what() << endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);  // Better than just finalizing - notifies all processes
+        MPI_Abort(MPI_COMM_WORLD, 1);  
         return 1;
     }
 
