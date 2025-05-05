@@ -417,7 +417,7 @@ int main() {
 
         // Load graph data and compute initial SSSP on rank 0
         if (rank == 0) {
-            string filename = "../Dataset/bitcoin.txt";
+            string filename = "../Dataset/sample_graph.txt";
             
             try {
                 load_data(filename, n, m, src, dst, weights);

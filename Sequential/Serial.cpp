@@ -377,7 +377,7 @@ int main() {
         vector<int> src, dst;
         vector<double> weights;
 
-        string filename = "../Dataset/bitcoin.txt"; 
+        string filename = "../Dataset/sample_graph.txt"; 
         try {
             auto start_load = high_resolution_clock::now();
             load_data(filename, n, m, src, dst, weights);
