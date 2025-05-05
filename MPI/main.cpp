@@ -411,6 +411,8 @@ int main() {
         vector<double> initial_dist;
         vector<int> initial_parent;
 
+
+        
         auto start_time = MPI_Wtime();
 
 

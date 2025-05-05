@@ -443,7 +443,7 @@ int main(int argc, char* argv[]) {
         omp_set_num_threads(num_threads);
         cout << "Running with " << num_threads << " threads" << endl;
 
-        string filename = "../Dataset/bitcoin.txt";
+        string filename = "../Dataset/sample_graph.txt";
         if (argc > 2) {
             filename = argv[2];
         }

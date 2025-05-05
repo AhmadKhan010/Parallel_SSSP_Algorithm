@@ -349,10 +349,14 @@ void load_updates(const string& filename, vector<Edge>& changes, vector<bool>& i
     if (!file.is_open()) {
         throw runtime_error("Error opening updates file: " + filename);
     }
+
+    int num_updates;
+    file >> num_updates;
+
     string type;
     int u, v;
     double w;
-    while (file >> type >> u >> v >> w) {
+    while (file >> u >> v >> w >> type) {
         if (type == "1" || type == "i") {
             changes.push_back({u, v, w});
             isInsertion.push_back(true);
@@ -423,7 +427,7 @@ int main() {
              cout << "Applying batch changes:" << endl;
              for (size_t i = 0; i < changes.size(); ++i) {
                  const auto& edge = changes[i];
-                 cout << "  Change " << i << ": (" << edge.u << ", " << edge.v << ", " << edge.weight << ") - " << (isInsertion[i] ? "Insert" : "Delete") << endl;
+                 //cout << "  Change " << i << ": (" << edge.u << ", " << edge.v << ", " << edge.weight << ") - " << (isInsertion[i] ? "Insert" : "Delete") << endl;
                  if (edge.u <= 0 || edge.u > n || edge.v <= 0 || edge.v > n) {
                      cerr << "Invalid update edge: (" << edge.u << ", " << edge.v << ")" << endl;
                      throw runtime_error("Update edge endpoints out of range");
