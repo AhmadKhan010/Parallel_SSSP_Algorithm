@@ -451,7 +451,7 @@ int main() {
         vector<int> src, dst;
         vector<double> weights;
 
-        string filename = "../Dataset/data.txt"; 
+        string filename = "../Dataset/sample_graph.txt"; 
         try {
             auto start_load = high_resolution_clock::now();
             load_data(filename, n, m, src, dst, weights);
@@ -494,7 +494,7 @@ int main() {
             vector<bool> isInsertion;
 
             //Load updates from file
-            string updates_filename = "../Dataset/update.txt";
+            string updates_filename = "../Dataset/updates.txt";
 
             load_updates(updates_filename, changes, isInsertion);
 

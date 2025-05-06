@@ -100,15 +100,15 @@ struct Graph {
     }
 };
 
-// Update SSSP based on Algorithms 2 and 3 from the paper (lock-free)
-void updateSSSPBatch_Paper(Graph& g, const vector<Edge>& changes, const vector<bool>& isInsertion) {
+
+void updateSSSPBatch(Graph& g, const vector<Edge>& changes, const vector<bool>& isInsertion) {
     // Store initial parent array to represent the tree T before updates
     vector<int> initial_parent = g.parent;
 
     // --- Algorithm 2: Identify Affected Vertices ---
     auto start_alg2 = high_resolution_clock::now();
 
-    // Reset flags (can be done in parallel)
+    // Reset flags 
     #pragma omp parallel for
     for (int i = 1; i <= g.n; ++i) {
         g.affected_del[i] = 0;
@@ -410,19 +410,19 @@ int main(int argc, char* argv[]) {
         vector<int> src, dst;
         vector<double> weights;
 
-        int num_threads = 4;
+        int num_threads = 2;
         if (argc > 1) {
             num_threads = atoi(argv[1]);
         }
         omp_set_num_threads(num_threads);
         cout << "Running with " << num_threads << " threads" << endl;
 
-        string filename = "../Dataset/data.txt";
+        string filename = "../Dataset/sample_graph.txt";
         if (argc > 2) {
             filename = argv[2];
         }
 
-        string updates_filename = "../Dataset/update.txt";
+        string updates_filename = "../Dataset/updates.txt";
         if (argc > 3) {
             updates_filename = argv[3];
         }
@@ -474,7 +474,7 @@ int main(int argc, char* argv[]) {
             }
 
             start = high_resolution_clock::now();
-            updateSSSPBatch_Paper(g, changes, isInsertion);
+            updateSSSPBatch(g, changes, isInsertion);
             end = high_resolution_clock::now();
             cout << "\nSSSP update took " << duration_cast<milliseconds>(end - start).count() << "ms" << endl;
 
