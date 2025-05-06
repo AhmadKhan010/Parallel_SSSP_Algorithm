@@ -7,7 +7,6 @@
 #include <fstream>
 #include <omp.h>
 #include <chrono>
-#include <atomic>
 
 using namespace std;
 using namespace std::chrono;
@@ -20,21 +19,6 @@ struct Edge {
     double weight;
 };
 
-// Custom atomic min operation for use in OpenMP
-inline bool atomic_min(double* addr, double val) {
-    double old;
-    bool changed = false;
-    #pragma omp critical
-    {
-        old = *addr;
-        if (val < old) {
-            *addr = val;
-            changed = true;
-        }
-    }
-    return changed;
-}
-
 // Graph structure in CSR format
 struct Graph {
     vector<int> adj;        // CSR adjacency list (edge endpoints)
@@ -42,12 +26,12 @@ struct Graph {
     vector<double> weights; // Edge weights
     vector<double> dist;    // Distance from source
     vector<int> parent;     // Parent in SSSP tree
-    vector<vector<int>> children; // Children in SSSP tree
     int n;                  // Number of vertices
-    int m;                  // Number of edges
-    
-    // Track vertices that need recalculation
-    vector<char> need_update; // Using char for better cache alignment
+    int m;                  // Number of edges (original count * 2)
+
+    // Flags based on paper's description
+    vector<char> affected_del; // Affected by deletion propagation
+    vector<char> affected;     // Affected by any change (for relaxation)
 
     Graph(int n, int m, const vector<int>& src, const vector<int>& dst, const vector<double>& weights) {
         try {
@@ -57,15 +41,15 @@ struct Graph {
 
             this->n = n;
             this->m = m * 2; // Double for undirected edges
-            
+
             // Resize vectors for 1-based indexing
             dist.resize(n + 1, INFINITY_VAL);
             parent.resize(n + 1, -1);
-            children.resize(n + 1);
             row_ptr.resize(n + 2, 0);
             adj.resize(this->m);
             this->weights.resize(this->m);
-            need_update.resize(n + 1, 0);
+            affected_del.resize(n + 1, 0); // Initialize flags to false
+            affected.resize(n + 1, 0);     // Initialize flags to false
 
             // Build CSR with 1-based indexing
             vector<int> edge_count(n + 1, 0);
@@ -78,7 +62,7 @@ struct Graph {
             for (int i = 1; i <= n; i++) {
                 row_ptr[i + 1] = row_ptr[i] + edge_count[i];
                 if (row_ptr[i + 1] > this->m) {
-                    throw runtime_error("CSR index out of bounds");
+                    throw runtime_error("CSR index calculation potentially out of bounds");
                 }
             }
 
@@ -101,273 +85,256 @@ struct Graph {
         }
     }
 
-    // Build children list based on parent array - now parallel
-    void buildChildren() {
-        for (int i = 1; i <= n; i++) {
-            children[i].clear();
-        }
-        
-        #pragma omp parallel for
-        for (int i = 1; i <= n; i++) {
-            if (parent[i] != -1) {
-                #pragma omp critical
-                {
-                    children[parent[i]].push_back(i);
-                }
+    // Helper to find edge index in CSR (needed for deletion marking)
+    // Returns -1 if not found
+    int findEdgeIndex(int u, int target_v) {
+        if (u < 1 || u > n) return -1;
+        if (u + 1 >= row_ptr.size()) return -1;
+        for (int i = row_ptr[u]; i < row_ptr[u + 1]; ++i) {
+            if (i < 0 || i >= adj.size()) continue;
+            if (adj[i] == target_v) {
+                return i;
             }
         }
+        return -1;
     }
 };
 
-// Mark descendants as affected (DFS) - modified for parallelism
-void markDescendants(Graph& g, int v, vector<int>& affected_vertices) {
-    vector<int> stack;
-    stack.push_back(v);
-    
-    while (!stack.empty()) {
-        int current = stack.back();
-        stack.pop_back();
-        
-        g.dist[current] = INFINITY_VAL;
-        g.parent[current] = -1;
-        g.need_update[current] = 1;
-        affected_vertices.push_back(current);
-        
-        // Add all children to stack
-        for (int child : g.children[current]) {
-            stack.push_back(child);
-        }
-    }
-}
+// Update SSSP based on Algorithms 2 and 3 from the paper (lock-free)
+void updateSSSPBatch_Paper(Graph& g, const vector<Edge>& changes, const vector<bool>& isInsertion) {
+    // Store initial parent array to represent the tree T before updates
+    vector<int> initial_parent = g.parent;
 
-// Parallel delta-stepping SSSP algorithm
-void deltaStepSSSP(Graph& g, vector<int>& affected_vertices, double delta = 1.0) {
-    const int num_buckets = 1000;  // Adjust based on graph diameter
-    vector<vector<int>> buckets(num_buckets);
-    vector<char> in_bucket(g.n + 1, 0);
-    
-    // Initialize buckets with affected vertices
-    for (int v : affected_vertices) {
-        g.need_update[v] = 0;  // Reset need_update flag
-        if (g.dist[v] != INFINITY_VAL) {
-            int bucket_idx = min(int(g.dist[v] / delta), num_buckets - 1);
-            buckets[bucket_idx].push_back(v);
-            in_bucket[v] = 1;
-        }
-    }
-    
-    // Process buckets in order
-    for (int b = 0; b < num_buckets; b++) {
-        while (!buckets[b].empty()) {
-            vector<int> current_bucket;
-            swap(current_bucket, buckets[b]);
-            
-            // Process current bucket in parallel
-            #pragma omp parallel
-            {
-                vector<pair<int, double>> local_updates;
-                
-                #pragma omp for nowait
-                for (size_t i = 0; i < current_bucket.size(); i++) {
-                    int u = current_bucket[i];
-                    in_bucket[u] = 0;
-                    double dist_u = g.dist[u];
-                    
-                    // Process all outgoing edges
-                    for (int j = g.row_ptr[u]; j < g.row_ptr[u + 1]; j++) {
-                        int v = g.adj[j];
-                        double weight = g.weights[j];
-                        double new_dist = dist_u + weight;
-                        
-                        if (new_dist < g.dist[v]) {
-                            local_updates.push_back({v, new_dist});
-                        }
-                    }
-                }
-                
-                // Apply updates with proper synchronization
-                #pragma omp critical
-                {
-                    for (auto& update : local_updates) {
-                        int v = update.first;
-                        double new_dist = update.second;
-                        
-                        if (new_dist < g.dist[v]) {
-                            g.dist[v] = new_dist;
-                            
-                            // Find parent
-                            for (int j = g.row_ptr[v]; j < g.row_ptr[v + 1]; j++) {
-                                int u = g.adj[j];
-                                if (abs(g.dist[v] - g.dist[u] - g.weights[j]) < 1e-6) {
-                                    g.parent[v] = u;
-                                    break;
-                                }
-                            }
-                            
-                            if (!in_bucket[v]) {
-                                int bucket_idx = min(int(new_dist / delta), num_buckets - 1);
-                                buckets[bucket_idx].push_back(v);
-                                in_bucket[v] = 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
+    // --- Algorithm 2: Identify Affected Vertices ---
+    auto start_alg2 = high_resolution_clock::now();
 
-// Update SSSP for multiple edge changes
-void updateSSSPBatch(Graph& g, const vector<Edge>& changes, const vector<bool>& isInsertion) {
-    // Build children list for deletion handling
-    auto start = high_resolution_clock::now();
-    g.buildChildren();
-    auto end = high_resolution_clock::now();
-    cout << "Build children took " << duration_cast<milliseconds>(end - start).count() << "ms" << endl;
-    
-    vector<int> affected_vertices;
-    
-    // Step 1: Process deletions first - identify affected vertices
-    start = high_resolution_clock::now();
-    for (size_t i = 0; i < changes.size(); i++) {
+    // Reset flags (can be done in parallel)
+    #pragma omp parallel for
+    for (int i = 1; i <= g.n; ++i) {
+        g.affected_del[i] = 0;
+        g.affected[i] = 0;
+    }
+
+    // Process Deletions (Parallel Loop 1)
+    #pragma omp parallel for
+    for (size_t i = 0; i < changes.size(); ++i) {
         if (!isInsertion[i]) {
-            int u = changes[i].u, v = changes[i].v;
-            
-            // Find both path directions
-            int x = (g.dist[u] > g.dist[v]) ? u : v;
-            int y = (x == u) ? v : u;
-            
-            if (g.parent[x] == y) { // Edge is in SSSP tree
-                markDescendants(g, x, affected_vertices);
+            int u = changes[i].u;
+            int v = changes[i].v;
+            if (u < 1 || u > g.n || v < 1 || v > g.n) continue;
+
+            // Check if edge was in the initial SSSP tree T
+            int child_node = -1;
+            if (v >= 0 && v < initial_parent.size() && initial_parent[v] == u) {
+                child_node = v;
+            } else if (u >= 0 && u < initial_parent.size() && initial_parent[u] == v) {
+                child_node = u;
+            }
+
+            if (child_node != -1) {
+                if (child_node >= 1 && child_node <= g.n) {
+                    g.dist[child_node] = INFINITY_VAL;
+                    g.affected_del[child_node] = 1;
+                    g.affected[child_node] = 1;
+                }
+            }
+
+            // Mark edge as deleted in CSR (find both directions)
+            int idx_uv = g.findEdgeIndex(u, v);
+            if (idx_uv != -1) {
+                if (idx_uv >= 0 && idx_uv < g.adj.size()) {
+                    g.adj[idx_uv] = -1;
+                    g.weights[idx_uv] = INFINITY_VAL;
+                }
+            }
+            int idx_vu = g.findEdgeIndex(v, u);
+            if (idx_vu != -1) {
+                if (idx_vu >= 0 && idx_vu < g.adj.size()) {
+                    g.adj[idx_vu] = -1;
+                    g.weights[idx_vu] = INFINITY_VAL;
+                }
             }
         }
     }
-    end = high_resolution_clock::now();
-    cout << "Process deletions took " << duration_cast<milliseconds>(end - start).count() << "ms" << endl;
-    
-    // Step 2: Process insertions - update distances
-    start = high_resolution_clock::now();
-    for (size_t i = 0; i < changes.size(); i++) {
+
+    // Process Insertions (Parallel Loop 2)
+    #pragma omp parallel for
+    for (size_t i = 0; i < changes.size(); ++i) {
         if (isInsertion[i]) {
-            int u = changes[i].u, v = changes[i].v;
+            int u = changes[i].u;
+            int v = changes[i].v;
             double w = changes[i].weight;
-            
-            // Update edge weights in CSR
-            bool found_forward = false, found_backward = false;
-            
-            #pragma omp parallel for
-            for (int i = g.row_ptr[u]; i < g.row_ptr[u + 1]; i++) {
-                if (g.adj[i] == v) {
-                    g.weights[i] = w;
-                    #pragma omp atomic write
-                    found_forward = true;
-                }
+            if (u < 1 || u > g.n || v < 1 || v > g.n || w < 0) continue;
+
+            // Update edge weight in CSR
+            int idx_uv = g.findEdgeIndex(u, v);
+            if (idx_uv != -1 && idx_uv >= 0 && idx_uv < g.weights.size() && g.adj[idx_uv] != -1) {
+                g.weights[idx_uv] = w;
             }
-            
-            #pragma omp parallel for
-            for (int i = g.row_ptr[v]; i < g.row_ptr[v + 1]; i++) {
-                if (g.adj[i] == u) {
-                    g.weights[i] = w;
-                    #pragma omp atomic write
-                    found_backward = true;
-                }
+            int idx_vu = g.findEdgeIndex(v, u);
+            if (idx_vu != -1 && idx_vu >= 0 && idx_vu < g.weights.size() && g.adj[idx_vu] != -1) {
+                g.weights[idx_vu] = w;
             }
-            
-            // If edge doesn't exist in CSR, we'd need to add it
-            // For simplicity, assuming edges already exist
-            
-            // Check if we can improve distances
-            if (g.dist[u] + w < g.dist[v]) {
-                g.dist[v] = g.dist[u] + w;
+
+            // Check potential path improvements
+            double dist_u = g.dist[u];
+            double dist_v = g.dist[v];
+
+            // Check u -> v
+            if (dist_u != INFINITY_VAL && dist_u + w < dist_v) {
+                g.dist[v] = dist_u + w;
                 g.parent[v] = u;
-                g.need_update[v] = 1;
-                affected_vertices.push_back(v);
+                g.affected[v] = 1;
             }
-            
-            if (g.dist[v] + w < g.dist[u]) {
-                g.dist[u] = g.dist[v] + w;
+            // Check v -> u
+            if (dist_v != INFINITY_VAL && dist_v + w < dist_u) {
+                g.dist[u] = dist_v + w;
                 g.parent[u] = v;
-                g.need_update[u] = 1;
-                affected_vertices.push_back(u);
+                g.affected[u] = 1;
             }
         }
     }
-    end = high_resolution_clock::now();
-    cout << "Process insertions took " << duration_cast<milliseconds>(end - start).count() << "ms" << endl;
-    
-    // Step 3: Update affected subgraph
-    start = high_resolution_clock::now();
-    deltaStepSSSP(g, affected_vertices);
-    end = high_resolution_clock::now();
-    cout << "Delta-stepping took " << duration_cast<milliseconds>(end - start).count() << "ms" << endl;
+    auto end_alg2 = high_resolution_clock::now();
+    cout << "Algorithm 2 (Identify Affected) took " << duration_cast<milliseconds>(end_alg2 - start_alg2).count() << "ms" << endl;
+
+    // --- Algorithm 3: Update Affected Subgraph ---
+    auto start_alg3 = high_resolution_clock::now();
+
+    // Precompute initial children list for efficiency in Part 1
+    vector<vector<int>> initial_children(g.n + 1);
+    for (int i = 1; i <= g.n; ++i) {
+        if (initial_parent[i] != -1 && initial_parent[i] >= 1 && initial_parent[i] <= g.n) {
+            initial_children[initial_parent[i]].push_back(i);
+        }
+    }
+
+    // Part 1: Propagate Deletions
+    auto start_alg3_p1 = high_resolution_clock::now();
+    bool deletion_propagated = true;
+    while (deletion_propagated) {
+        deletion_propagated = false;
+        vector<char> affected_del_snapshot = g.affected_del;
+
+        #pragma omp parallel for reduction(||:deletion_propagated) schedule(dynamic)
+        for (int v = 1; v <= g.n; ++v) {
+            if (affected_del_snapshot[v]) {
+                g.affected_del[v] = 0;
+
+                if (v >= 0 && v < initial_children.size()) {
+                    for (int c : initial_children[v]) {
+                        if (c >= 1 && c <= g.n) {
+                            if (g.dist[c] != INFINITY_VAL) {
+                                g.dist[c] = INFINITY_VAL;
+                                g.parent[c] = -1;
+                                g.affected_del[c] = 1;
+                                g.affected[c] = 1;
+                                deletion_propagated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    auto end_alg3_p1 = high_resolution_clock::now();
+    cout << "Algorithm 3 Part 1 (Deletion Propagate) took " << duration_cast<milliseconds>(end_alg3_p1 - start_alg3_p1).count() << "ms" << endl;
+
+    // Part 2: Iterative Relaxation
+    auto start_alg3_p2 = high_resolution_clock::now();
+    bool changed_in_iteration = true;
+    int iteration_count = 0;
+    while (changed_in_iteration) {
+        iteration_count++;
+        changed_in_iteration = false;
+        vector<char> affected_snapshot = g.affected;
+
+        #pragma omp parallel for reduction(||:changed_in_iteration) schedule(dynamic)
+        for (int v = 1; v <= g.n; ++v) {
+            if (affected_snapshot[v]) {
+                g.affected[v] = 0;
+
+                double dist_v = g.dist[v];
+
+                if (v + 1 >= g.row_ptr.size()) continue;
+                for (int i = g.row_ptr[v]; i < g.row_ptr[v + 1]; ++i) {
+                    if (i < 0 || i >= g.adj.size()) continue;
+
+                    int n_node = g.adj[i];
+                    if (n_node == -1) continue;
+
+                    double w = g.weights[i];
+                    if (w == INFINITY_VAL) continue;
+
+                    if (n_node < 1 || n_node > g.n) continue;
+
+                    double dist_n = g.dist[n_node];
+
+                    if (dist_v != INFINITY_VAL) {
+                        double potential_dist_n = dist_v + w;
+                        if (potential_dist_n < dist_n - 1e-9) {
+                            g.dist[n_node] = potential_dist_n;
+                            g.parent[n_node] = v;
+                            g.affected[n_node] = 1;
+                            changed_in_iteration = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    auto end_alg3_p2 = high_resolution_clock::now();
+    cout << "Algorithm 3 Part 2 (Relaxation) took " << duration_cast<milliseconds>(end_alg3_p2 - start_alg3_p2).count() << "ms"
+         << " in " << iteration_count << " iterations" << endl;
+
+    auto end_alg3 = high_resolution_clock::now();
+    cout << "Algorithm 3 (Update Affected) took " << duration_cast<milliseconds>(end_alg3 - start_alg3).count() << "ms" << endl;
 }
 
-// Parallel version of Dijkstra's algorithm
+// Sequential version of Dijkstra's algorithm
 void dijkstra(Graph& g, int source) {
     try {
         if (source < 1 || source > g.n) {
             throw runtime_error("Invalid source vertex");
         }
 
-        #pragma omp parallel for
         for (int i = 1; i <= g.n; i++) {
             g.dist[i] = INFINITY_VAL;
             g.parent[i] = -1;
         }
-        
+
         g.dist[source] = 0.0;
-        
-        // Use a sequential priority queue but parallelize edge relaxation
+
         using pq_element = pair<double, int>;
         priority_queue<pq_element, vector<pq_element>, greater<pq_element>> pq;
-        vector<bool> finished(g.n + 1, false);
-        
+
         pq.push({0.0, source});
-        
+
         while (!pq.empty()) {
             double d = pq.top().first;
             int u = pq.top().second;
             pq.pop();
-            
-            if (finished[u]) continue;
-            finished[u] = true;
-            
-            // Relaxation phase can be parallelized
-            vector<pq_element> next_vertices;
-            
-            #pragma omp parallel
-            {
-                vector<pq_element> thread_next;
-                
-                #pragma omp for nowait
-                for (int i = g.row_ptr[u]; i < g.row_ptr[u + 1]; i++) {
-                    int v = g.adj[i];
-                    if (finished[v]) continue;
-                    
-                    double w = g.weights[i];
-                    double new_dist = g.dist[u] + w;
-                    
-                    if (new_dist < g.dist[v]) {
-                        // Use atomic operations for updating distance and parent
-                        if (atomic_min(&g.dist[v], new_dist)) {
-                            #pragma omp critical
-                            {
-                                g.parent[v] = u;
-                            }
-                            thread_next.push_back({new_dist, v});
-                        }
+
+            if (d > g.dist[u] + 1e-9) {
+                continue;
+            }
+
+            if (u + 1 >= g.row_ptr.size()) continue;
+            for (int i = g.row_ptr[u]; i < g.row_ptr[u + 1]; i++) {
+                if (i < 0 || i >= g.adj.size()) continue;
+
+                int v = g.adj[i];
+                double w = g.weights[i];
+
+                if (v < 1 || v > g.n || w < 0 || w == INFINITY_VAL) continue;
+
+                if (g.dist[u] != INFINITY_VAL) {
+                    double new_dist_v = g.dist[u] + w;
+                    if (new_dist_v < g.dist[v] - 1e-9) {
+                        g.dist[v] = new_dist_v;
+                        g.parent[v] = u;
+                        pq.push({new_dist_v, v});
                     }
                 }
-                
-                #pragma omp critical
-                {
-                    next_vertices.insert(next_vertices.end(), thread_next.begin(), thread_next.end());
-                }
-            }
-            
-            // Add vertices to the queue outside parallel region
-            for (auto& item : next_vertices) {
-                pq.push(item);
             }
         }
     } catch (const exception& e) {
@@ -387,39 +354,47 @@ void load_data(string filename, int& n, int& m, vector<int>& src, vector<int>& d
     dst.resize(m);
     weights.resize(m);
 
-    // Add bounds checking to ensure all vertex IDs are valid
     int max_vertex_id = 0;
-    
+
     for (int i = 0; i < m; i++) {
         file >> src[i] >> dst[i] >> weights[i];
         max_vertex_id = max(max_vertex_id, max(src[i], dst[i]));
     }
-    
-    // If max vertex ID is larger than reported n, update n
+
     if (max_vertex_id > n) {
         cerr << "Warning: Vertices numbered up to " << max_vertex_id 
              << " but graph size is " << n << ". Updating n." << endl;
         n = max_vertex_id;
     }
-    
+
     file.close();
 }
 
-// Reads batch updates from a file and fills changes and isInsertion vectors.
-// File format: each line is either "I u v w" (insert edge u-v with weight w) or "D u v w" (delete edge u-v, w is ignored or can be 0)
 void load_updates(const string& filename, vector<Edge>& changes, vector<bool>& isInsertion) {
     ifstream file(filename);
     if (!file.is_open()) {
         throw runtime_error("Error opening updates file: " + filename);
     }
+
+    int num_updates;
+    file >> num_updates;
+
     string type;
     int u, v;
     double w;
-    while (file >> type >> u >> v >> w) {
-        if (type == "I" || type == "i") {
+    while (file >> u >> v >> w >> type) {
+        if((u <=10 || v<=10) && type == "0") {
+           cout<< " Deleting edge (" << u << ", " << v << ") with weight " << w << endl;
+        }
+
+        if((u<=10 || v<=10) && type == "1") {
+           cout<< " Inserting edge (" << u << ", " << v << ") with weight " << w << endl;
+        }
+
+        if (type == "1" || type == "i") {
             changes.push_back({u, v, w});
             isInsertion.push_back(true);
-        } else if (type == "D" || type == "d") {
+        } else if (type == "0" || type == "d") {
             changes.push_back({u, v, w});
             isInsertion.push_back(false);
         } else {
@@ -434,8 +409,7 @@ int main(int argc, char* argv[]) {
         int n, m;
         vector<int> src, dst;
         vector<double> weights;
-        
-        // Set number of threads based on command-line argument or default to 4
+
         int num_threads = 4;
         if (argc > 1) {
             num_threads = atoi(argv[1]);
@@ -443,85 +417,73 @@ int main(int argc, char* argv[]) {
         omp_set_num_threads(num_threads);
         cout << "Running with " << num_threads << " threads" << endl;
 
-        string filename = "../Dataset/sample_graph.txt";
+        string filename = "../Dataset/data.txt";
         if (argc > 2) {
             filename = argv[2];
         }
 
-        string updates_filename = "../Dataset/updates.txt";
+        string updates_filename = "../Dataset/update.txt";
         if (argc > 3) {
             updates_filename = argv[3];
         }
-        
+
         auto start_total = high_resolution_clock::now();
-        
+
         try {
             auto start = high_resolution_clock::now();
             load_data(filename, n, m, src, dst, weights);
             auto end = high_resolution_clock::now();
             cout << "Loaded graph with " << n << " vertices and " << m << " edges in " 
                  << duration_cast<milliseconds>(end - start).count() << "ms" << endl;
-            
-            // Verify data
-            bool valid_data = true;
-            #pragma omp parallel for reduction(&:valid_data)
-            for (int i = 0; i < m; i++) {
-                if (src[i] <= 0 || src[i] > n || dst[i] <= 0 || dst[i] > n) {
-                    #pragma omp critical
-                    {
-                        cerr << "Invalid edge: (" << src[i] << ", " << dst[i] << ")" << endl;
-                    }
-                    valid_data = false;
-                }
-            }
-            
-            if (!valid_data) {
-                throw runtime_error("Edge endpoints out of range");
-            }
-            
-            // Initialize graph
+
             start = high_resolution_clock::now();
             Graph g(n, m, src, dst, weights);
             end = high_resolution_clock::now();
             cout << "Graph construction took " << duration_cast<milliseconds>(end - start).count() << "ms" << endl;
 
-            // Initialize SSSP tree using Dijkstra's algorithm from vertex 1
             start = high_resolution_clock::now();
             dijkstra(g, 1);
             end = high_resolution_clock::now();
             cout << "Initial Dijkstra computation took " << duration_cast<milliseconds>(end - start).count() << "ms" << endl;
 
-            // Example batch of updates (using 1-based vertex numbers)
             vector<Edge> changes;
             vector<bool> isInsertion;
             load_updates(updates_filename, changes, isInsertion);
 
-            // Verify update vertices are in range
+            bool valid_updates = true;
             for (const auto& edge : changes) {
                 if (edge.u <= 0 || edge.u > n || edge.v <= 0 || edge.v > n) {
                     cerr << "Invalid update edge: (" << edge.u << ", " << edge.v << ")" << endl;
-                    throw runtime_error("Update edge endpoints out of range");
+                    valid_updates = false;
+                    break;
                 }
+            }
+            if (!valid_updates) {
+                throw runtime_error("Update edge endpoints out of range");
             }
 
             cout << "Before updates:\n";
-            // Only print first 10 vertices for large graphs
             int print_count = min(10, n);
             for (int i = 1; i <= print_count; i++) {
-                cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
+                if (i >= 0 && i < g.dist.size() && i < g.parent.size()) {
+                    cout << "Vertex " << i << ": Dist = " << (g.dist[i] == INFINITY_VAL ? "inf" : to_string(g.dist[i])) << ", Parent = " << g.parent[i] << "\n";
+                }
             }
             if (n > print_count) {
                 cout << "..." << endl;
             }
 
             start = high_resolution_clock::now();
-            updateSSSPBatch(g, changes, isInsertion);
+            updateSSSPBatch_Paper(g, changes, isInsertion);
             end = high_resolution_clock::now();
-            cout << "SSSP update took " << duration_cast<milliseconds>(end - start).count() << "ms" << endl;
+            cout << "\nSSSP update took " << duration_cast<milliseconds>(end - start).count() << "ms" << endl;
 
             cout << "\nAfter updates:\n";
+            
             for (int i = 1; i <= print_count; i++) {
-                cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
+                if (i >= 0 && i < g.dist.size() && i < g.parent.size()) {
+                    cout << "Vertex " << i << ": Dist = " << (g.dist[i] == INFINITY_VAL ? "inf" : to_string(g.dist[i])) << ", Parent = " << g.parent[i] << "\n";
+                }
             }
             if (n > print_count) {
                 cout << "..." << endl;
@@ -531,10 +493,10 @@ int main(int argc, char* argv[]) {
             cerr << "Error during execution: " << e.what() << endl;
             return 1;
         }
-        
+
         auto end_total = high_resolution_clock::now();
         cout << "Total execution time: " << duration_cast<milliseconds>(end_total - start_total).count() << "ms" << endl;
-        
+
     } catch (const exception& e) {
         cerr << "Fatal error: " << e.what() << endl;
         return 1;

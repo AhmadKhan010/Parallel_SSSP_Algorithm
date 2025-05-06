@@ -112,6 +112,41 @@ struct Graph {
             }
         }
     }
+
+    // Helper to find edge index in CSR
+    // Returns -1 if not found
+    int findEdgeIndex(int u, int target_v) {
+        if (u < 1 || u > n) return -1;
+        // Bounds check for row_ptr access
+        if (u + 1 >= row_ptr.size()) return -1;
+        for (int i = row_ptr[u]; i < row_ptr[u + 1]; ++i) {
+            // Bounds check for adj access
+            if (i < 0 || i >= adj.size()) continue;
+            if (adj[i] == target_v) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // Helper to update edge weight (or mark as deleted)
+    void updateEdgeWeight(int u, int v, double new_weight) {
+        int idx_uv = findEdgeIndex(u, v);
+        if (idx_uv != -1) {
+            // Bounds check before modifying weights
+            if (idx_uv >= 0 && idx_uv < weights.size()) {
+                weights[idx_uv] = new_weight;
+            }
+        }
+        // Update the reverse edge as well for undirected graph
+        int idx_vu = findEdgeIndex(v, u);
+        if (idx_vu != -1) {
+            // Bounds check before modifying weights
+            if (idx_vu >= 0 && idx_vu < weights.size()) {
+                weights[idx_vu] = new_weight;
+            }
+        }
+    }
 };
 
 // Custom comparator for min-heap priority queue
@@ -162,20 +197,20 @@ void updateSSSPBatch(Graph& g, const vector<Edge>& changes, const vector<bool>& 
 
             // Identify which vertex might be disconnected if the edge was in the tree
             int x = -1, y = -1;
-             if (g.dist[u] != INFINITY && g.dist[v] != INFINITY) { // Only consider if both are reachable
-                 x = (g.dist[u] > g.dist[v]) ? u : v;
-                 y = (x == u) ? v : u;
-             } else if (g.dist[u] != INFINITY) { // If only u is reachable, v might depend on u
+             // Check parent relationship based on current SSSP tree
+             if (g.parent[v] == u) { // u is parent of v
                  x = v; y = u;
-             } else if (g.dist[v] != INFINITY) { // If only v is reachable, u might depend on v
+             } else if (g.parent[u] == v) { // v is parent of u
                  x = u; y = v;
              }
 
-
-            // If x is valid and its parent was y, the edge was in the SSSP tree
-            if (x != -1 && g.parent[x] == y) {
+            // If the edge was in the SSSP tree (x is the child, y is the parent)
+            if (x != -1) {
                 markDescendants(g, x, pq);
             }
+
+            // Regardless of whether it was in the tree, mark the edge as deleted in CSR
+            g.updateEdgeWeight(u, v, INFINITY); // Set weight to infinity
         }
     }
 
@@ -187,6 +222,10 @@ void updateSSSPBatch(Graph& g, const vector<Edge>& changes, const vector<bool>& 
              // Bounds check
              if (u < 1 || u > g.n || v < 1 || v > g.n || w < 0) continue; // Ignore invalid edges/weights
 
+            // Update edge weight in CSR (handles adding back previously deleted edge or new edge if structure allows)
+            // Note: This assumes the CSR structure has space/entries for potential insertions.
+            // A robust implementation might need dynamic CSR updates.
+            g.updateEdgeWeight(u, v, w);
 
             // Check if the new edge offers a shorter path from u to v
             if (g.dist[u] != INFINITY && g.dist[u] + w < g.dist[v]) {
@@ -218,23 +257,27 @@ void updateSSSPBatch(Graph& g, const vector<Edge>& changes, const vector<bool>& 
         if (d > g.dist[z] + 1e-9) continue;
 
         // Relax edges outgoing from z
+        // Bounds check for row_ptr access
+        if (z + 1 >= g.row_ptr.size()) continue;
         for (int i = g.row_ptr[z]; i < g.row_ptr[z + 1]; i++) {
              // Bounds check for adjacency list access
              if (i < 0 || i >= g.adj.size()) continue; // Should not happen with correct CSR
 
-
             int neighbor = g.adj[i];
             double weight = g.weights[i];
 
-             // Bounds check for neighbor
-             if (neighbor < 1 || neighbor > g.n || weight < 0) continue;
+             // Bounds check for neighbor AND skip deleted edges (weight == INFINITY)
+             if (neighbor < 1 || neighbor > g.n || weight < 0 || weight == INFINITY) continue;
 
 
             // If a shorter path to neighbor is found through z
-            if (g.dist[z] != INFINITY && g.dist[z] + weight < g.dist[neighbor]) {
-                g.dist[neighbor] = g.dist[z] + weight;
-                g.parent[neighbor] = z;
-                pq.push({g.dist[neighbor], neighbor});
+            if (g.dist[z] != INFINITY) { // Check g.dist[z] is finite before adding weight
+                 double new_dist_neighbor = g.dist[z] + weight;
+                 if (new_dist_neighbor < g.dist[neighbor] - 1e-9) { // Epsilon comparison
+                    g.dist[neighbor] = new_dist_neighbor;
+                    g.parent[neighbor] = z;
+                    pq.push({g.dist[neighbor], neighbor});
+                }
             }
         }
     }
@@ -351,12 +394,35 @@ void load_updates(const string& filename, vector<Edge>& changes, vector<bool>& i
     }
 
     int num_updates;
-    file >> num_updates;
+    if (!(file >> num_updates)) { // Read number of updates first
+         file.close();
+         throw runtime_error("Error reading number of updates from file: " + filename);
+     }
 
-    string type;
+
+    changes.reserve(num_updates);
+    isInsertion.reserve(num_updates);
+
+    string type; // Read type as string first for flexibility
     int u, v;
     double w;
-    while (file >> u >> v >> w >> type) {
+    int count = 0;
+    while (count < num_updates && (file >> u >> v >> w >> type)) {
+        if (u <= 0 || v <= 0) { // Basic validation
+             cerr << "Warning: Invalid vertex ID (<=0) in updates file line " << count + 1 << ": " << u << ", " << v << endl;
+             count++; // Increment count even if skipped
+             continue; 
+         }
+
+        // Debug print for specific deletion
+        if(u <= 10 || v <= 10 && (type == "0")) {
+           cout<< "deletion for edge (" << u << ", " << v << ") with weight " << w << endl;
+        }
+
+        if(u <= 10 || v <= 10 && (type == "1")) {
+            cout<< "insertion for edge (" << u << ", " << v << ") with weight " << w << endl;
+         }
+
         if (type == "1" || type == "i") {
             changes.push_back({u, v, w});
             isInsertion.push_back(true);
@@ -364,12 +430,16 @@ void load_updates(const string& filename, vector<Edge>& changes, vector<bool>& i
             changes.push_back({u, v, w});
             isInsertion.push_back(false);
         } else {
-            cerr << "Unknown update type in updates file: " << type << endl;
+            cerr << "Warning: Unknown update type '" << type << "' in updates file line " << count + 1 << endl;
+            // Decide whether to skip or treat as error
         }
+        count++;
     }
+     if (count != num_updates) {
+         cerr << "Warning: Expected " << num_updates << " updates, but processed " << count << " lines." << endl;
+     }
     file.close();
 }
-
 
 
 int main() {
@@ -381,7 +451,7 @@ int main() {
         vector<int> src, dst;
         vector<double> weights;
 
-        string filename = "../Dataset/sample_graph.txt"; 
+        string filename = "../Dataset/data.txt"; 
         try {
             auto start_load = high_resolution_clock::now();
             load_data(filename, n, m, src, dst, weights);
@@ -412,14 +482,19 @@ int main() {
             
             int source_node = 1; 
             cout << "Running initial Dijkstra from source vertex " << source_node << "..." << endl;
+            
+            auto start_dijkstra = high_resolution_clock::now();
             dijkstra(g, source_node);
+            auto end_dijkstra = high_resolution_clock::now();
+            cout << "Initial Dijkstra computation took "
+                 << duration_cast<milliseconds>(end_dijkstra - start_dijkstra).count() << "ms" << endl;
 
 
             vector<Edge> changes;
             vector<bool> isInsertion;
 
             //Load updates from file
-            string updates_filename = "../Dataset/updates.txt";
+            string updates_filename = "../Dataset/update.txt";
 
             load_updates(updates_filename, changes, isInsertion);
 

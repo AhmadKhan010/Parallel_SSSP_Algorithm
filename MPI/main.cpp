@@ -6,6 +6,7 @@
 #include <fstream>
 #include <mpi.h>
 #include <metis.h>
+#include <cstring> // Needed for memcpy
 
 using namespace std;
 
@@ -16,6 +17,14 @@ struct Edge {
     int u, v;
     double weight;
     bool isInsertion;
+};
+
+// Raw structure for broadcasting edge updates efficiently
+struct EdgeUpdateRaw {
+    int u;
+    int v;
+    double weight;
+    int isInsertion; // Use int (0 or 1) for easier MPI transfer
 };
 
 // Graph structure in CSR format
@@ -411,21 +420,21 @@ int main() {
         vector<double> initial_dist;
         vector<int> initial_parent;
 
+        vector<char> graph_data_buffer;
+        vector<char> sssp_data_buffer;
+        long long graph_buffer_size = 0;
+        long long sssp_buffer_size = 0;
 
-        
         auto start_time = MPI_Wtime();
-
-
 
         // Load graph data and compute initial SSSP on rank 0
         if (rank == 0) {
             string filename = "../Dataset/sample_graph.txt";
-            
+
             try {
                 load_data(filename, n, m, src, dst, weights);
                 cout << "Loaded graph with " << n << " vertices and " << m << " edges" << endl;
-                
-           
+
                 // Verify data
                 for (int i = 0; i < m; i++) {
                     if (src[i] <= 0 || src[i] > n || dst[i] <= 0 || dst[i] > n) {
@@ -435,12 +444,33 @@ int main() {
                 }
 
                 // Initialize full graph for Dijkstra's
-                vector<int> init_partition(n + 1, 0);
+                vector<int> init_partition(n + 1, 0); // Dummy partition for full graph
                 Graph g_full(n, m, src, dst, weights, rank, init_partition);
                 dijkstra(g_full, 1);
                 initial_dist = g_full.dist;
                 initial_parent = g_full.parent;
                 cout << "Completed initial SSSP computation" << endl;
+
+                // Pack graph data for broadcast
+                size_t src_bytes = m * sizeof(int);
+                size_t dst_bytes = m * sizeof(int);
+                size_t weights_bytes = m * sizeof(double);
+                graph_buffer_size = src_bytes + dst_bytes + weights_bytes;
+                graph_data_buffer.resize(graph_buffer_size);
+                char* ptr = graph_data_buffer.data();
+                memcpy(ptr, src.data(), src_bytes); ptr += src_bytes;
+                memcpy(ptr, dst.data(), dst_bytes); ptr += dst_bytes;
+                memcpy(ptr, weights.data(), weights_bytes);
+
+                // Pack SSSP data for broadcast
+                size_t dist_bytes = (n + 1) * sizeof(double);
+                size_t parent_bytes = (n + 1) * sizeof(int);
+                sssp_buffer_size = dist_bytes + parent_bytes;
+                sssp_data_buffer.resize(sssp_buffer_size);
+                ptr = sssp_data_buffer.data();
+                memcpy(ptr, initial_dist.data(), dist_bytes); ptr += dist_bytes;
+                memcpy(ptr, initial_parent.data(), parent_bytes);
+
             }
             catch (const exception& e) {
                 cerr << "Error in graph loading/initialization: " << e.what() << endl;
@@ -449,77 +479,106 @@ int main() {
             }
         }
 
-        // Broadcast graph dimensions and initial SSSP tree
+        // Broadcast graph dimensions
         MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
         MPI_Bcast(&m, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        // Broadcast packed graph data size and then data
+        MPI_Bcast(&graph_buffer_size, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
         if (rank != 0) {
+            graph_data_buffer.resize(graph_buffer_size);
+            // Resize local vectors based on received m
             src.resize(m);
             dst.resize(m);
             weights.resize(m);
+        }
+        MPI_Bcast(graph_data_buffer.data(), graph_buffer_size, MPI_BYTE, 0, MPI_COMM_WORLD);
+
+        // Broadcast packed SSSP data size and then data
+        MPI_Bcast(&sssp_buffer_size, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
+        if (rank != 0) {
+            sssp_data_buffer.resize(sssp_buffer_size);
+            // Resize local vectors based on received n
             initial_dist.resize(n + 1);
             initial_parent.resize(n + 1);
         }
-        MPI_Bcast(src.data(), m, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(dst.data(), m, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(weights.data(), m, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Bcast(initial_dist.data(), n + 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Bcast(initial_parent.data(), n + 1, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(sssp_data_buffer.data(), sssp_buffer_size, MPI_BYTE, 0, MPI_COMM_WORLD);
+
+        // Unpack data on non-zero ranks
+        if (rank != 0) {
+            // Unpack graph data
+            size_t src_bytes = m * sizeof(int);
+            size_t dst_bytes = m * sizeof(int);
+            size_t weights_bytes = m * sizeof(double);
+            const char* ptr = graph_data_buffer.data();
+            memcpy(src.data(), ptr, src_bytes); ptr += src_bytes;
+            memcpy(dst.data(), ptr, dst_bytes); ptr += dst_bytes;
+            memcpy(weights.data(), ptr, weights_bytes);
+
+            // Unpack SSSP data
+            size_t dist_bytes = (n + 1) * sizeof(double);
+            size_t parent_bytes = (n + 1) * sizeof(int);
+            ptr = sssp_data_buffer.data();
+            memcpy(initial_dist.data(), ptr, dist_bytes); ptr += dist_bytes;
+            memcpy(initial_parent.data(), ptr, parent_bytes);
+        }
 
         // Partition graph with METIS
         vector<int> partition = partitionGraph(n, m, src, dst, size, rank);
 
         // Initialize local graph
         Graph g(n, m, src, dst, weights, rank, partition);
-        g.dist = initial_dist;
-        g.parent = initial_parent;
+        g.dist = initial_dist; // Assign broadcasted initial state
+        g.parent = initial_parent; // Assign broadcasted initial state
 
-        // Broadcast edge changes
+        // Broadcast edge changes 
         vector<Edge> changes;
+        vector<EdgeUpdateRaw> changes_raw;
         int num_changes = 0;
+
         if (rank == 0) {
             string updates_filename = "../Dataset/updates.txt";
             try {
-
-                load_updates(updates_filename, changes);
-                num_changes = changes.size();
+                vector<Edge> loaded_changes;
+                load_updates(updates_filename, loaded_changes);
+                num_changes = loaded_changes.size();
                 cout << "Loaded " << num_changes << " updates" << endl;
+
+                changes_raw.resize(num_changes);
+                for (int i = 0; i < num_changes; ++i) {
+                    changes_raw[i] = {loaded_changes[i].u, loaded_changes[i].v, loaded_changes[i].weight, loaded_changes[i].isInsertion ? 1 : 0};
+                }
+                changes = loaded_changes; // Keep on rank 0
+
             } catch (const exception& e) {
                 cerr << "Error loading updates: " << e.what() << endl;
                 MPI_Abort(MPI_COMM_WORLD, 1);
                 return 1;
             }
-           
         }
+
         MPI_Bcast(&num_changes, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (rank != 0) changes.resize(num_changes);
-        vector<int> change_u(num_changes), change_v(num_changes);
-        vector<double> change_w(num_changes);
-        vector<int> change_isInsertion(num_changes);
-        if (rank == 0) {
-            for (int i = 0; i < num_changes; i++) {
-                change_u[i] = changes[i].u;
-                change_v[i] = changes[i].v;
-                change_w[i] = changes[i].weight;
-                change_isInsertion[i] = changes[i].isInsertion ? 1 : 0;
-            }
-        }
-        MPI_Bcast(change_u.data(), num_changes, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(change_v.data(), num_changes, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(change_w.data(), num_changes, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Bcast(change_isInsertion.data(), num_changes, MPI_INT, 0, MPI_COMM_WORLD);
+
         if (rank != 0) {
+            changes_raw.resize(num_changes);
+        }
+        MPI_Bcast(changes_raw.data(), num_changes * sizeof(EdgeUpdateRaw), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+        if (rank != 0) {
+            changes.resize(num_changes);
             for (int i = 0; i < num_changes; i++) {
-                changes[i] = {change_u[i], change_v[i], change_w[i], change_isInsertion[i] == 1};
+                changes[i] = {changes_raw[i].u, changes_raw[i].v, changes_raw[i].weight, changes_raw[i].isInsertion == 1};
             }
         }
 
         int print_count = min(10, n);
-        // Print initial state
+        // Print initial state (using the already available initial_dist/parent)
         if (rank == 0) {
             cout << "Before updates:\n";
             for (int i = 1; i <= print_count; i++) {
-                cout << "Vertex " << i << ": Dist = " << g.dist[i] << ", Parent = " << g.parent[i] << "\n";
+                 cout << "Vertex " << i << ": Dist = " << initial_dist[i] << ", Parent = " << initial_parent[i] << "\n";
             }
+             if (n > print_count) cout << "..." << endl;
         }
 
         // Update SSSP
@@ -537,14 +596,13 @@ int main() {
             cout << "Total execution time: " << (end_time - start_time) * 1000 << " ms" << endl;
         }
 
-
         if (rank == 0) {
             cout << "\nAfter updates:\n";
-            
             for (int i = 1; i <= print_count; i++) {
-                cout << "Vertex " << i << ": Dist = " << global_dists[i] << ", Parent = " << global_parents[i] << "\n";
+                cout << "Vertex " << i << ": Dist = " << (global_dists[i] == INFINITY ? "inf" : to_string(global_dists[i]))
+                     << ", Parent = " << global_parents[i] << "\n";
             }
-            cout<<"..."<<endl;
+             if (n > print_count) cout << "..." << endl;
         }
 
     } catch (const exception& e) {
